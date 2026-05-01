@@ -1,0 +1,889 @@
+---
+title: "EARLI LCA Differential Expression"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    self-contained: true
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: true
+  cache-lazy: false
+  fig-width: 9
+  fig-height: 6
+---
+
+```{r setup}
+library(GEOquery)
+library(limma)
+library(tidyverse)
+library(DESeq2)
+library(here)
+library(sva)
+library(edgeR)
+library(RUVSeq)
+library(matrixStats)
+library(parallel)
+library(pheatmap)
+library(ggrepel)
+library(GenomicRanges)
+
+theme_set(theme_bw(base_size = 14))
+```
+
+## read in EARLI summarized experiment
+
+see r/earli_se.r
+
+```{r}
+earli_se = readRDS(here("data/earli_summarizedexperiment.rds"))
+```
+
+
+## Count-level EDA
+
+### Library sizes
+
+```{r library-sizes}
+#| fig-height: 9
+lib_df <- tibble(
+    sample       = colnames(earli_se),
+    total_counts = colSums(assay(earli_se, "counts")),
+    lca_label    = earli_se$lca_label
+)
+
+ggplot(lib_df, aes(x = reorder(sample, total_counts), y = total_counts / 1e6, fill = lca_label)) +
+    geom_col() +
+    coord_flip() +
+    labs(x = NULL, y = "Total counts (millions)", title = "Library sizes by sample")
+```
+
+Library sizes range from 4.0 M to 44.1 M reads (median 10.4 M, n = 189).
+Most samples fall between 8 M and 15 M reads. One Hyper sample (EARLI_11533)
+and two neighboring samples exceed 40 M reads and stand out visually.
+
+Is there any relationship between LCA label and library size?
+
+```{r library-size-by-lca}
+wt <- wilcox.test(total_counts ~ lca_label, data = lib_df)
+
+lib_df |>
+    ggplot(aes(x = lca_label, y = total_counts / 1e6, fill = lca_label)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(width = 0.15, alpha = 0.4) +
+    labs(
+        x        = NULL,
+        y        = "Total counts (millions)",
+        title    = "Library size by LCA label",
+        subtitle = paste0("Wilcoxon p = ", signif(wt$p.value, 3))
+    )
+```
+
+Library depth does not differ meaningfully between subgroups
+(Hyper median 10.0 M, Hypo median 10.5 M; Wilcoxon p = 0.769).
+Library size is unlikely to confound the primary Hyper vs. Hypo contrast.
+
+### Top genes by library fraction
+
+Are any genes dominating individual libraries?
+
+```{r library-composition}
+cnt_totals <- rowSums(assay(earli_se, "counts"))
+lib_total  <- sum(cnt_totals)
+
+tibble(ensg = names(cnt_totals), lib_pct = cnt_totals / lib_total * 100) |>
+    left_join(
+        as_tibble(mcols(rowRanges(earli_se))) |>
+            mutate(ensg = names(rowRanges(earli_se))),
+        by = "ensg"
+    ) |>
+    arrange(desc(lib_pct)) |>
+    mutate(cumulative_pct = cumsum(lib_pct)) |>
+    slice_head(n = 30) |>
+    ggplot(aes(x = reorder(SYMBOL, lib_pct), y = lib_pct)) +
+    geom_col() +
+    coord_flip() +
+    labs(x = NULL, y = "% of total library", title = "Top 30 genes by library fraction")
+```
+
+No single gene dominates library composition. *S100A9* contributes the
+largest fraction (1.6% of total counts), with the top five genes
+(*S100A9*, *PCSK5*, *B2M*, *ACTB*, *S100A8*) accounting for ~4.5% of
+reads combined. Not concerning.
+
+### PCA
+
+```{r pca}
+vsd <- vst(DESeqDataSet(earli_se, design = ~ age_scaled + sex + lca_label), blind = TRUE)
+
+pca_res <- prcomp(t(assay(vsd)), scale. = FALSE)
+pct_var <- round(100 * pca_res$sdev^2 / sum(pca_res$sdev^2), 1)
+
+tibble(PC = seq_along(pct_var), pct_var = pct_var) |>
+    slice_head(n = 20) |>
+    ggplot(aes(x = PC, y = pct_var)) +
+    geom_col() + geom_line() + geom_point() +
+    labs(y = "% variance explained", title = "Scree plot")
+```
+
+PC1 explains 19.8% of variance and PC2 explains 9.4%, with a pronounced
+drop-off after the first components and a slower decline thereafter.
+The first four PCs together account for ~42% of total variance.
+
+```{r pca-plots-setup}
+col_data <- as.data.frame(colData(earli_se))
+
+pca_df <- as_tibble(pca_res$x[, 1:4], rownames = "sample") |>
+    left_join(as_tibble(col_data, rownames = "sample"), by = "sample")
+
+pc_labs <- function(i, j) {
+    labs(
+        x = paste0("PC", i, " (", pct_var[i], "%)"),
+        y = paste0("PC", j, " (", pct_var[j], "%)")
+    )
+}
+```
+
+```{r pca-plots}
+tibble(PC = seq_along(pct_var), pct_var = pct_var) |>
+    slice_head(n = 20) |>
+    ggplot(aes(x = PC, y = pct_var)) +
+    geom_col() + geom_line() + geom_point() +
+    labs(y = "% variance explained", title = "Scree plot")
+
+ggplot(pca_df, aes(PC1, PC2, color = lca_label)) +
+    geom_point() + pc_labs(1, 2) + ggtitle("PC1 vs PC2 — LCA label")
+
+ggplot(pca_df, aes(PC1, PC2, color = sex)) +
+    geom_point() + pc_labs(1, 2) + ggtitle("PC1 vs PC2 — sex")
+
+ggplot(pca_df, aes(PC1, PC2, color = age_scaled)) +
+    geom_point() +
+    scale_color_viridis_c() +
+    pc_labs(1, 2) + ggtitle("PC1 vs PC2 — age (scaled)")
+```
+
+LCA label and sex do not produce a clear separation in PC1/PC2 space. 
+The two groups overlap substantially. Three samples are notable outliers
+along PC1 (PC1 > 70), spanning both LCA subgroups, suggesting their
+separation in this component is not LCA-driven. No strong age gradient is
+visible in the first two PCs.
+
+Which PC is most associated with LCA label?
+
+```{r pc-lca-association}
+n_pcs <- min(20, ncol(pca_res$x))
+
+pc_lca_df <- as_tibble(pca_res$x[, 1:n_pcs], rownames = "sample") |>
+    left_join(as_tibble(col_data, rownames = "sample"), by = "sample")
+
+pc_assoc <- tibble(
+    pc     = paste0("PC", 1:n_pcs),
+    pc_idx = 1:n_pcs,
+    p_val  = map_dbl(1:n_pcs, \(i) {
+        kruskal.test(pca_res$x[, i] ~ earli_se$lca_label)$p.value
+    })
+) |>
+    arrange(p_val) |>
+    mutate(p_adj = p.adjust(p_val, method = "BH"))
+
+print(pc_assoc)
+
+best_pc <- pc_assoc$pc[1]
+cat("\nPC most associated with LCA label:", best_pc,
+    sprintf("(Kruskal-Wallis p = %.3g)", pc_assoc$p_val[1]), "\n")
+
+ggplot(pc_lca_df, aes(lca_label, .data[[best_pc]], fill = lca_label)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+    geom_jitter(width = 0.15, size = 1) +
+    labs(
+        x     = "LCA label",
+        y     = paste0(best_pc, " (", pct_var[pc_assoc$pc_idx[1]], "% variance)"),
+        title = paste(best_pc, "~ LCA label (most associated PC)")
+    ) +
+    theme(legend.position = "none")
+```
+
+PC4 (6.1% of variance) is the PC most strongly associated with LCA label
+(Kruskal-Wallis p = 1.3e-10, BH-adjusted p = 2.6e-9), followed by
+PC2 (p = 3.1e-7). The primary biological signal thus sits in PCs 2 and 4
+rather than the top component, which likely captures technical or other
+sources of variation dominant in this cohort.
+
+## Latent factor estimation
+
+Both SVAseq and RUVseq (RUVr) are run to infer unknown sources of variation
+while protecting the `lca_label` effect of interest. SVAseq uses a full vs.
+null model contrast to isolate variance unexplained by the biology of interest.
+RUVr uses residuals from a first-pass model that includes `lca_label`, so the
+factors it finds are orthogonal to the primary contrast by construction.
+
+### SVAseq
+
+```{r sva}
+dds_norm      <- estimateSizeFactors(DESeqDataSet(earli_se, design = ~ age_scaled + sex + lca_label))
+norm_log_cnts <- log1p(counts(dds_norm, normalized = TRUE))
+
+mod  <- model.matrix(~ age_scaled + sex + lca_label, data = col_data)
+mod0 <- model.matrix(~ age_scaled + sex,             data = col_data)
+
+n_sv <- num.sv(norm_log_cnts, mod)
+cat("Estimated number of SVs:", n_sv, "\n")
+
+sva_res <- svaseq(norm_log_cnts, mod, mod0, n.sv = n_sv)
+```
+
+SVAseq estimates **15 surrogate variables**, indicating a substantial
+amount of variance in the data that is unexplained by
+`lca_label`, `age_scaled`, or `sex`.
+
+### RUVseq (RUVr)
+
+```{r ruv}
+design_ruv <- model.matrix(~ lca_label + age_scaled + sex, data = col_data)
+
+y <- DGEList(counts = assay(earli_se, "counts"))
+y <- calcNormFactors(y, method = "upperquartile")
+y <- estimateGLMCommonDisp(y, design_ruv)
+y <- estimateGLMTagwiseDisp(y, design_ruv)
+fit <- glmFit(y, design_ruv)
+res <- residuals(fit, type = "deviance")
+
+set     <- newSeqExpressionSet(assay(earli_se, "counts"))
+ruv_res <- RUVr(set, rownames(set), k = n_sv, residuals = res)
+```
+
+### RUV k selection
+
+`k` is initialized from SVA's `num.sv()` estimate. Two diagnostics assess
+whether that choice is appropriate for RUVr:
+
+1. **Scree plot of deviance residuals** — singular values of the residual
+   matrix fed to RUVr. An elbow indicates a natural cutoff.
+2. **Genomic inflation (λ) vs k** — for each candidate k, RUVr is re-run
+   and edgeR LRT p-values for `lca_label` are extracted.
+   λ = median(x^2) / expected median under null; values near 1 indicate
+   well-calibrated tests.
+
+```{r ruv-scree}
+sv_decomp <- svd(res)
+sv_pct    <- sv_decomp$d^2 / sum(sv_decomp$d^2) * 100
+
+tibble(k = seq_along(sv_pct), pct_var = sv_pct) |>
+    slice_head(n = 30) |>
+    ggplot(aes(x = k, y = pct_var)) +
+    geom_col(fill = "steelblue", alpha = 0.8) +
+    geom_line() + geom_point() +
+    geom_vline(xintercept = n_sv, linetype = "dashed", color = "firebrick") +
+    annotate("text", x = n_sv + 0.4, y = sv_pct[1] * 0.9,
+             label = paste0("SVA k = ", n_sv), hjust = 0, color = "firebrick") +
+    labs(
+        x        = "Component (k)",
+        y        = "% variance in deviance residuals",
+        title    = "Scree plot of RUVr input (deviance residuals)",
+        subtitle = "Dashed line = k chosen by SVAseq num.sv()"
+    )
+```
+
+The first deviance-residual component captures 23.0% of residual variance,
+with a clear drop after the first component and a plateau beginning
+around k = 6. The SVAseq-suggested k = 15 captures 60.5% of cumulative
+residual variance.
+
+```{r ruv-k-selection}
+k_max <- min(n_sv + 5L, ncol(assay(earli_se, "counts")) - 1L)
+
+Y_svd <- svd(t(res), nu = k_max, nv = 0)
+
+y_base <- DGEList(counts = assay(earli_se, "counts"))
+y_base <- calcNormFactors(y_base, method = "upperquartile")
+y_base <- estimateGLMCommonDisp(y_base, design_ruv)
+y_base <- estimateGLMTagwiseDisp(y_base, design_ruv)
+
+lambda_df <- mclapply(seq_len(k_max), function(k) {
+    W <- Y_svd$u[, 1:k, drop = FALSE]
+    design_k <- cbind(
+        model.matrix(~ lca_label + age_scaled + sex, data = col_data),
+        W
+    )
+    fit_k  <- glmFit(y_base, design_k)
+    lrt_k  <- glmLRT(fit_k, coef = "lca_labelHyper")
+    pvals  <- lrt_k$table$PValue
+    chisq  <- qchisq(1 - pvals, df = 1)
+    lambda <- median(chisq, na.rm = TRUE) / qchisq(0.5, df = 1)
+    n_sig  <- sum(p.adjust(pvals, method = "BH") < 0.05, na.rm = TRUE)
+    tibble(k = k, lambda = lambda, n_sig = n_sig)
+}, mc.cores = 20L) |>
+    bind_rows()
+```
+
+```{r ruv-lambda-plot}
+lambda_df |>
+    ggplot(aes(x = k, y = lambda)) +
+    geom_line() + geom_point() +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray50") +
+    geom_vline(xintercept = n_sv, linetype = "dashed", color = "firebrick") +
+    annotate("text", x = n_sv + 0.3, y = max(lambda_df$lambda),
+             label = paste0("SVA k = ", n_sv), hjust = 0, color = "firebrick") +
+    labs(
+        x        = "k (RUV factors)",
+        y        = "Genomic inflation (λ)",
+        title    = "Genomic inflation vs RUV k",
+        subtitle = "λ ≈ 1 = well-calibrated | λ > 1 = inflation | λ < 1 = deflation"
+    )
+
+lambda_df |>
+    ggplot(aes(x = k, y = n_sig)) +
+    geom_line() + geom_point() +
+    geom_vline(xintercept = n_sv, linetype = "dashed", color = "firebrick") +
+    labs(x = "k (RUV factors)", y = "# genes BH < 0.05",
+         title = "Significant DE genes vs RUV k")
+```
+
+Genomic inflation (λ) remains between 4.4 and 4.9 across all k values
+tested, well above the conventional threshold of λ ~1, and does not
+meaningfully decrease as k increases. This is probably b/c the hyper and 
+hypo group are very different, and hence there are a lot of highly significant 
+DE genes across the range of tested k. The number of significant DE genes
+stabilizes between ~5,000 and ~5,400 from k = 13 onward, supporting the sva 
+inferred k = 15 as a reasonable choice.
+
+### RLE plots
+
+RLE (relative log expression) plots show per-sample distributions of expression
+values after subtracting each gene's median across all samples. Well-corrected
+data has boxes centered near 0 with similar widths across samples.
+
+```{r ruv-rle}
+#| fig-height: 8
+set.seed(42)
+gene_idx     <- sample(nrow(norm_log_cnts), min(5000L, nrow(norm_log_cnts)))
+k_candidates <- sort(unique(c(0L, 1L, floor(k_max / 3L), floor(2L * k_max / 3L), n_sv, k_max)))
+
+rle_df <- map_dfr(k_candidates, function(k) {
+    expr <- if (k == 0L) {
+        norm_log_cnts[gene_idx, ]
+    } else {
+        W <- Y_svd$u[, 1:k, drop = FALSE]
+        removeBatchEffect(norm_log_cnts[gene_idx, ], covariates = W)
+    }
+    row_meds <- apply(expr, 1, median)
+    rle_mat  <- expr - row_meds
+
+    as_tibble(t(rle_mat), rownames = "sample") |>
+        pivot_longer(-sample, names_to = "gene", values_to = "rle") |>
+        mutate(k = factor(paste0("k = ", k), levels = paste0("k = ", k_candidates)))
+})
+
+rle_df |>
+    ggplot(aes(x = sample, y = rle)) +
+    geom_boxplot(outlier.shape = NA, linewidth = 0.3) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "firebrick", linewidth = 0.4) +
+    coord_cartesian(ylim = c(-2, 2)) +
+    facet_wrap(~ k, ncol = 1) +
+    theme_bw() +
+    theme(axis.text.x = element_blank()) +
+    labs(
+        x        = NULL,
+        y        = "Relative log expression",
+        title    = "RLE plots across candidate RUV k values",
+        subtitle = "Well-corrected: boxes centered near 0 with uniform widths"
+    )
+
+rle_df |>
+    group_by(sample, k) |>
+    reframe(iqr = IQR(rle), median_dev = abs(median(rle))) |>
+    pivot_longer(c(iqr, median_dev), names_to = "metric", values_to = "value") |>
+    mutate(metric = recode(metric,
+        iqr        = "IQR (spread)",
+        median_dev = "|median| (centering)"
+    )) |>
+    ggplot(aes(x = k, y = value)) +
+    geom_boxplot() +
+    facet_wrap(~ metric, scales = "free_y") +
+    theme_bw() +
+    labs(
+        x        = "k (RUV factors)",
+        y        = NULL,
+        title    = "RLE summary across samples by k",
+        subtitle = "Lower IQR = less spread; lower |median| = better centering near 0"
+    )
+```
+
+Mean per-sample IQR decreases from 0.73 at k = 0 to 0.46 at k = 15, and median deviation (centering near zero) falls from 0.062 to 0.013, indicating steady improvement in between-sample comparability. The gains diminish noticeably beyond k ≈ 6–13, suggesting k = 15 provides solid correction without substantial over-fitting.
+
+### Factor characterization
+
+Spearman correlations between each latent factor and known sample variables.
+A strong correlation with a known variable suggests that factor is capturing
+that source of variation rather than a truly unknown confounder.
+
+```{r factor-characterization}
+known_vars <- tibble(
+    lib_size  = colSums(assay(earli_se, "counts")),
+    age       = earli_se$age_scaled,
+    sex       = as.numeric(earli_se$sex == "Male"),
+    lca_label = as.numeric(earli_se$lca_label == "Hyper")
+)
+
+sv_mat <- sva_res$sv
+colnames(sv_mat) <- paste0("SV", seq_len(ncol(sv_mat)))
+
+ruv_mat <- pData(ruv_res)[, grep("W_", colnames(pData(ruv_res))), drop = FALSE]
+colnames(ruv_mat) <- paste0("RUV", seq_len(ncol(ruv_mat)))
+
+all_vars <- cbind(as.matrix(known_vars), sv_mat, as.matrix(ruv_mat))
+cor_mat  <- cor(all_vars, method = "spearman")
+cor_sub  <- cor_mat[colnames(known_vars), c(colnames(sv_mat), colnames(ruv_mat))]
+
+pheatmap(
+    cor_sub,
+    main            = "Spearman correlation: known variables vs latent factors",
+    color           = colorRampPalette(c("blue", "white", "red"))(50),
+    breaks          = seq(-1, 1, length.out = 51),
+    display_numbers = TRUE,
+    number_format   = "%.2f",
+    cluster_cols    = FALSE
+)
+```
+
+SV6 shows the strongest correlation with any known variable (Spearman ρ = 0.81 with sex), indicating it primarily captures sex-related expression differences. SV3 correlates moderately with library size (ρ = −0.42). Most RUV factors show only weak correlations with all known covariates — as expected, given they are derived from residuals of a model that already conditions on `lca_label`, `age_scaled`, and `sex`.
+
+## Differential expression: Hyper vs Hypo
+
+Three RUV factors (k = 3) are included as covariates in both models. The W
+factors are orthogonal to `lca_label`, `age_scaled`, and `sex` by construction
+(derived from residuals of a model containing all three), so including them
+does not introduce collinearity with the primary contrast.
+
+```{r de-setup}
+k_de <- 3L
+W_de <- Y_svd$u[, 1:k_de, drop = FALSE]
+colnames(W_de) <- paste0("W", seq_len(k_de))
+
+col_data     <- as.data.frame(colData(earli_se))
+col_data_ruv <- col_data
+col_data_ruv[, colnames(W_de)] <- W_de
+
+cnt_mat <- assay(earli_se, "counts")
+```
+
+---
+
+### DESeq2
+
+DESeq2 fits a negative binomial GLM per gene. For large observational studies
+it can produce anti-conservative FDR estimates; results are presented alongside
+limma/voom for comparison. `apeglm` shrinkage is applied to LFC for
+visualization only — significance calls use the unshrunken Wald test p-values.
+
+```{r deseq2-fit}
+dds_ruv <- DESeqDataSetFromMatrix(
+    countData = cnt_mat,
+    colData   = col_data_ruv,
+    design    = ~ age_scaled + sex + W1 + W2 + W3 + lca_label
+)
+
+# Filter low-count genes: CPM > 1 in at least the size of the smaller group
+min_n   <- min(table(col_data_ruv$lca_label))
+keep    <- rowSums(cpm(cnt_mat) > 1) >= min_n
+dds_ruv <- dds_ruv[keep, ]
+
+dds_ruv <- DESeq(dds_ruv)
+```
+
+```{r deseq2-results}
+res_deseq2 <- results(
+    dds_ruv,
+    contrast = c("lca_label", "Hyper", "Hypo"),
+    alpha    = 0.05
+)
+
+res_deseq2_shrunk <- lfcShrink(
+    dds_ruv,
+    coef = "lca_label_Hyper_vs_Hypo",
+    type = "apeglm"
+)
+
+summary(res_deseq2)
+```
+
+DESeq2 identifies **7,275 DE genes** at BH-adjusted p < 0.05 from
+16,457 tested: 3,905 (24%) upregulated in Hyper and 3,370 (20%) upregulated in
+Hypo. No Cook's distance outlier genes were flagged.
+
+```{r deseq2-pval-hist}
+tibble(pvalue = res_deseq2$pvalue) |>
+    filter(!is.na(pvalue)) |>
+    ggplot(aes(x = pvalue)) +
+    geom_histogram(binwidth = 0.02, boundary = 0,
+                   fill = "steelblue", color = "white", alpha = 0.8) +
+    geom_hline(
+        yintercept = sum(!is.na(res_deseq2$pvalue)) * 0.02,
+        linetype = "dashed", color = "firebrick"
+    ) +
+    labs(
+        x        = "p-value",
+        y        = "Count",
+        title    = "DESeq2 p-value distribution: Hyper vs Hypo",
+        subtitle = "Dashed line = expected count per bin under global null"
+    ) +
+    theme_bw()
+```
+
+The p-value histogram shows a pronounced spike near zero with counts well
+above the null expectation (dashed line), consistent with widespread true
+signal. The relatively flat tail suggests good test calibration outside the
+region of signal.
+
+```{r deseq2-plot-data}
+deseq2_plot_df <- as_tibble(res_deseq2, rownames = "ensg") |>
+    dplyr::select(ensg, baseMean, pvalue, padj) |>
+    inner_join(
+        as_tibble(res_deseq2_shrunk, rownames = "ensg") |>
+            dplyr::select(ensg, log2FoldChange),
+        by = "ensg"
+    ) |>
+    filter(!is.na(padj)) |>
+    mutate(label = case_when(
+        padj < 0.05 & log2FoldChange > 0 ~ "Up in Hyper",
+        padj < 0.05 & log2FoldChange < 0 ~ "Up in Hypo",
+        TRUE                              ~ "NS"
+    ))
+```
+
+```{r deseq2-volcano}
+deseq2_plot_df |>
+    ggplot(aes(x = log2FoldChange, y = -log10(padj), color = label)) +
+    geom_point(alpha = 0.4, size = 0.8) +
+    scale_color_manual(values = c(
+        "Up in Hyper" = "firebrick",
+        "Up in Hypo"  = "steelblue",
+        "NS"          = "grey70"
+    )) +
+    geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey40") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+    labs(
+        x        = "shrunken log2 fold change (Hyper / Hypo)",
+        y        = "-log10(adjusted p-value)",
+        color    = NULL,
+        title    = "DESeq2 volcano: Hyper vs Hypo",
+        subtitle = "apeglm-shrunken LFC | significance from unshrunken padj < 0.05"
+    ) +
+    theme_bw()
+```
+
+Hyper-upregulated genes reach larger shrunken fold changes (LFC up to ~4)
+than Hypo-upregulated genes (LFC down to ~−2), suggesting stronger or more
+consistent expression changes in the Hyper subgroup.
+Several genes exceed −log10(padj) = 40.
+
+```{r deseq2-ma}
+deseq2_plot_df |>
+    ggplot(aes(x = log10(baseMean), y = log2FoldChange, color = label)) +
+    geom_point(alpha = 0.4, size = 0.8) +
+    scale_color_manual(values = c(
+        "Up in Hyper" = "firebrick",
+        "Up in Hypo"  = "steelblue",
+        "NS"          = "grey70"
+    )) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+    labs(
+        x        = "log10(mean normalized count)",
+        y        = "shrunken log2 fold change (Hyper / Hypo)",
+        color    = NULL,
+        title    = "DESeq2 MA plot: Hyper vs Hypo",
+        subtitle = "apeglm shrinkage pulls low-count genes toward 0"
+    ) +
+    theme_bw()
+```
+
+apeglm shrinkage visibly compresses LFC estimates for low-abundance genes
+toward zero, producing a narrowing funnel at low mean counts while
+preserving large estimates for highly expressed genes.
+
+---
+
+### limma/voom
+
+limma/voom uses a precision-weighted linear model on log-CPM values. It is
+generally better calibrated than DESeq2 in large observational studies because
+its empirical Bayes variance shrinkage is less sensitive to the mean-variance
+relationship assumptions that can break down at large n. Two voom passes are
+used: the first estimates the mean-variance trend, the second incorporates it
+into precision weights for fitting.
+
+```{r limma-fit}
+dge <- DGEList(counts = cnt_mat[keep, ], group = col_data_ruv$lca_label)
+dge <- calcNormFactors(dge, method = "TMM")
+
+design_voom <- model.matrix(
+    ~ age_scaled + sex + W1 + W2 + W3 + lca_label,
+    data = col_data_ruv
+)
+
+# First voom pass: estimate mean-variance trend
+v0     <- voom(dge, design_voom, plot = FALSE)
+# Second voom pass: reweight with trend
+v      <- voom(dge, design_voom, plot = TRUE)
+
+fit_v  <- lmFit(v, design_voom)
+fit_v  <- eBayes(fit_v, robust = TRUE)
+```
+
+```{r limma-results}
+res_limma <- topTable(
+    fit_v,
+    coef   = "lca_labelHyper",
+    number = Inf,
+    sort.by = "none"
+) |>
+    as_tibble(rownames = "ensg")
+
+cat("limma/voom DE genes (BH < 0.05):", sum(res_limma$adj.P.Val < 0.05), "\n")
+```
+
+limma/voom identifies **7,230 DE genes** at BH < 0.05: 3,368 upregulated
+in Hyper and 3,862 upregulated in Hypo.
+
+```{r limma-pval-hist}
+res_limma |>
+    filter(!is.na(P.Value)) |>
+    ggplot(aes(x = P.Value)) +
+    geom_histogram(binwidth = 0.02, boundary = 0,
+                   fill = "steelblue", color = "white", alpha = 0.8) +
+    geom_hline(
+        yintercept = sum(!is.na(res_limma$P.Value)) * 0.02,
+        linetype = "dashed", color = "firebrick"
+    ) +
+    labs(
+        x        = "p-value",
+        y        = "Count",
+        title    = "limma/voom p-value distribution: Hyper vs Hypo",
+        subtitle = "Dashed line = expected count per bin under global null"
+    ) +
+    theme_bw()
+```
+
+The limma/voom p-value distribution closely mirrors the DESeq2 distribution,
+with a pronounced spike near zero consistent with widespread true signal.
+
+```{r limma-plot-data}
+limma_plot_df <- res_limma |>
+    filter(!is.na(adj.P.Val)) |>
+    mutate(label = case_when(
+        adj.P.Val < 0.05 & logFC > 0 ~ "Up in Hyper",
+        adj.P.Val < 0.05 & logFC < 0 ~ "Up in Hypo",
+        TRUE                          ~ "NS"
+    ))
+```
+
+```{r limma-volcano}
+limma_plot_df |>
+    ggplot(aes(x = logFC, y = -log10(adj.P.Val), color = label)) +
+    geom_point(alpha = 0.4, size = 0.8) +
+    scale_color_manual(values = c(
+        "Up in Hyper" = "firebrick",
+        "Up in Hypo"  = "steelblue",
+        "NS"          = "grey70"
+    )) +
+    geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey40") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+    labs(
+        x        = "log2 fold change (Hyper / Hypo)",
+        y        = "-log10(adjusted p-value)",
+        color    = NULL,
+        title    = "limma/voom volcano: Hyper vs Hypo",
+        subtitle = "logFC from eBayes fit | BH-adjusted p-value"
+    ) +
+    theme_bw()
+```
+
+The limma/voom volcano is broadly symmetric, with Hypo-upregulated
+genes (3,862) slightly outnumbering Hyper-upregulated genes (3,368),
+a modest directional reversal compared to the DESeq2 result,
+reflecting differences in variance estimation between the two methods.
+
+```{r limma-ma}
+limma_plot_df |>
+    ggplot(aes(x = AveExpr, y = logFC, color = label)) +
+    geom_point(alpha = 0.4, size = 0.8) +
+    scale_color_manual(values = c(
+        "Up in Hyper" = "firebrick",
+        "Up in Hypo"  = "steelblue",
+        "NS"          = "grey70"
+    )) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+    labs(
+        x        = "Average log2-CPM",
+        y        = "log2 fold change (Hyper / Hypo)",
+        color    = NULL,
+        title    = "limma/voom MA plot: Hyper vs Hypo"
+    ) +
+    theme_bw()
+```
+
+The MA plot shows good centering of fold changes around zero at high
+average expression, with the expected increase in LFC spread at lower
+expression levels.
+
+---
+
+### Method comparison
+
+```{r method-comparison}
+# Join on shared genes, using unshrunken DESeq2 LFC for a fair comparison
+comparison_df <- inner_join(
+    as_tibble(res_deseq2, rownames = "ensg") |>
+        dplyr::select(ensg, deseq2_lfc = log2FoldChange,
+                      deseq2_pval = pvalue, deseq2_padj = padj),
+    res_limma |>
+        dplyr::select(ensg, limma_lfc = logFC,
+                      limma_pval = P.Value, limma_padj = adj.P.Val),
+    by = "ensg"
+) |>
+    filter(!is.na(deseq2_padj), !is.na(limma_padj)) |>
+    mutate(
+        sig_deseq2 = deseq2_padj < 0.05,
+        sig_limma  = limma_padj  < 0.05,
+        concordance = case_when(
+            sig_deseq2 & sig_limma  ~ "Both",
+            sig_deseq2 & !sig_limma ~ "DESeq2 only",
+            !sig_deseq2 & sig_limma ~ "limma only",
+            TRUE                    ~ "Neither"
+        )
+    )
+
+# Counts per concordance category
+comparison_df |> dplyr::count(concordance, sort = TRUE)
+```
+
+6,544 genes are significant in both methods, while 731 are
+DESeq2-specific and 686 are limma-specific — representing high
+concordance given the independent estimation frameworks.
+The 8,496 genes non-significant in both form the majority of
+the tested transcriptome.
+
+```{r lfc-correlation}
+# LFC concordance between methods
+comparison_df |>
+    slice_sample(n = min(5000, nrow(comparison_df))) |>
+    ggplot(aes(x = deseq2_lfc, y = limma_lfc, color = concordance)) +
+    geom_point(alpha = 0.3, size = 0.6) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+    scale_color_manual(values = c(
+        "Both"        = "purple",
+        "DESeq2 only" = "firebrick",
+        "limma only"  = "steelblue",
+        "Neither"     = "grey70"
+    )) +
+    labs(
+        x        = "DESeq2 log2FC",
+        y        = "limma/voom log2FC",
+        color    = NULL,
+        title    = "LFC concordance: DESeq2 vs limma/voom",
+        subtitle = "Dashed line = identity"
+    ) +
+    theme_bw()
+```
+
+LFC estimates are highly concordant between methods (Spearman ρ = 0.94),
+with points closely tracking the identity line across the full fold-change
+range.
+
+```{r pval-correlation}
+# P-value concordance: -log10 scale
+comparison_df |>
+    slice_sample(n = min(5000, nrow(comparison_df))) |>
+    ggplot(aes(x = -log10(deseq2_pval), y = -log10(limma_pval),
+               color = concordance)) +
+    geom_point(alpha = 0.3, size = 0.6) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+    scale_color_manual(values = c(
+        "Both"        = "purple",
+        "DESeq2 only" = "firebrick",
+        "limma only"  = "steelblue",
+        "Neither"     = "grey70"
+    )) +
+    labs(
+        x        = "-log10(p): DESeq2",
+        y        = "-log10(p): limma/voom",
+        color    = NULL,
+        title    = "P-value concordance: DESeq2 vs limma/voom",
+        subtitle = "limma stronger among weak-evidence genes; DESeq2 dominates the significant tail"
+    ) +
+    theme_bw()
+```
+
+```{r pval-direction-table}
+# Fraction of genes where each method assigns stronger evidence, by -log10(p) bin
+tmp_dir <- comparison_df[!is.na(comparison_df$deseq2_pval) & !is.na(comparison_df$limma_pval), ]
+tmp_dir$d   <- -log10(tmp_dir$deseq2_pval)
+tmp_dir$l   <- -log10(tmp_dir$limma_pval)
+tmp_dir$direction <- ifelse(tmp_dir$l > tmp_dir$d, "limma stronger", "DESeq2 stronger")
+tmp_dir$bin <- cut(tmp_dir$d,
+                   breaks = c(0, 1, 2, 5, 10, Inf),
+                   labels = c("[0, 1)", "[1, 2)", "[2, 5)", "[5, 10)", "≥10"),
+                   right  = FALSE)
+
+tbl_dir <- as.data.frame.matrix(table(tmp_dir$bin, tmp_dir$direction))
+tbl_dir$Total           <- rowSums(tbl_dir)
+tbl_dir$`% limma stronger` <- round(100 * tbl_dir[["limma stronger"]] / tbl_dir$Total, 1)
+tbl_dir$`DESeq2 -log10(p)` <- rownames(tbl_dir)
+knitr::kable(
+    tbl_dir[, c("DESeq2 -log10(p)", "DESeq2 stronger", "limma stronger", "Total", "% limma stronger")],
+    row.names = FALSE,
+    caption   = "Direction of evidence advantage by DESeq2 significance bin"
+)
+```
+
+Evidence strength is similarly well-correlated overall (Spearman ρ = 0.91 on
+the −log10(p) scale), but the direction of the advantage is not uniform. Limma
+tends to assign higher significance at the lower end of the spectrum, while 
+DESeq2 tends to assign lower pvalues to highly significant genes
+
+```{r upset-overlap}
+# Concordance counts split by effect direction for jointly significant genes
+comparison_df$dir_concordance <- with(comparison_df, {
+    ifelse(concordance == "Both" & deseq2_lfc > 0, "Both (up)",
+    ifelse(concordance == "Both" & deseq2_lfc < 0, "Both (down)",
+           concordance))
+})
+comparison_df$dir_concordance <- factor(comparison_df$dir_concordance,
+    levels = c("Both (up)", "Both (down)", "DESeq2 only", "limma only", "Neither"))
+
+dir_counts <- as.data.frame(table(comparison_df$dir_concordance))
+names(dir_counts) <- c("dir_concordance", "n")
+
+ggplot(dir_counts, aes(x = dir_concordance, y = n, fill = dir_concordance)) +
+    geom_col(alpha = 0.85, show.legend = FALSE) +
+    scale_fill_manual(values = c(
+        "Both (up)"   = "#7B2D8B",
+        "Both (down)" = "#C299CC",
+        "DESeq2 only" = "firebrick",
+        "limma only"  = "steelblue",
+        "Neither"     = "grey70"
+    )) +
+    geom_text(aes(label = scales::comma(n)), vjust = -0.4, size = 3.2) +
+    scale_y_continuous(labels = scales::comma,
+                       expand = expansion(mult = c(0, 0.08))) +
+    labs(x = NULL, y = "Number of genes",
+         title = "DE gene overlap by direction: DESeq2 vs limma/voom",
+         subtitle = "BH-adjusted p < 0.05; direction = sign of log2FC") +
+    theme_bw()
+```
+
+The 6,544 jointly significant genes represent ~90% of all DESeq2 hits and
+~90% of all limma hits. Among these, every gene with a concordant call also
+has a concordant direction of effect — 3,334 upregulated and 3,210
+downregulated in Hyper vs. Hypo — with zero direction conflicts.
+The method-specific hits (731 DESeq2-only, 686 limma-only) are the only region
+of disagreement, and these are concentrated among lower-evidence
+genes as described above.
+
+```{r}
+# write_csv(comparison_df, here("data/earli_limma_deseq_comp.csv"))
+```
+

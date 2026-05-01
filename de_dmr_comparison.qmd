@@ -1,0 +1,445 @@
+---
+title: "Methylation–Expression Concordance: DMRs vs Differential Expression"
+format:
+  pdf:
+    toc: true
+    toc-depth: 2
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(SummarizedExperiment)
+library(GenomicRanges)
+library(GenomeInfoDb)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(here)
+
+# expression data
+comparison_df <- read_csv(here("data/earli_limma_deseq_comp.csv"))
+earli_se      <- readRDS(here("data/earli_summarizedexperiment.rds"))
+# unfiltered dmr data
+dmr_gr <- readRDS(here("data/private/DMRs.Granges.rds"))
+
+row_meta <- rowRanges(earli_se) |>
+    as.data.frame() |>
+    as_tibble(rownames = "ensg") |>
+    dplyr::select(ensg, chr = seqnames, start, end, strand,
+                  gene_symbol = SYMBOL, gene_name = GENENAME,
+                  gene_type = GENETYPE, autosomal_protein_coding,
+                  hemoglobin_related)
+
+# note: no significance filter
+all_expr <- comparison_df |>
+    left_join(row_meta, by = "ensg") |>
+    filter(!is.na(gene_symbol), !is.na(deseq2_lfc))
+
+
+# Classify each DMR as intragenic (overlaps a gene body) or intergenic.
+# dist_to_gene is distance to nearest feature regardless of strand
+gene_ref <- genes(TxDb.Hsapiens.UCSC.hg38.knownGene)
+gene_ref <- keepSeqlevels(gene_ref,
+                          intersect(seqlevels(dmr_gr), seqlevels(gene_ref)),
+                          pruning.mode = "coarse")
+
+d2n <- distanceToNearest(dmr_gr, gene_ref, ignore.strand = TRUE)
+
+dmr_gr_annot <- as_tibble(dmr_gr) |>
+    dplyr::rename(SYMBOL = symbol, dir = direction, dmr_p = p_value, dmr_fdr = p_fdr,
+                  dmr_beta = mean_beta)
+
+dmr_gr_annot$dist_to_gene <- NA_real_
+dmr_gr_annot$dist_to_gene[queryHits(d2n)] <- mcols(d2n)$distance
+
+dmr_gr_annot$dmr_class <- ifelse(dmr_gr_annot$dist_to_gene == 0,
+                                  "intragenic", "intergenic")
+
+# Where there are multiple DMR for a given gene, choose the one with the
+# smallest pval
+dmr_per_gene <- dmr_gr_annot |>
+    group_by(SYMBOL) |>
+    slice_min(dmr_p, n = 1, with_ties = FALSE) |>
+    ungroup() |>
+    dplyr::select(SYMBOL, dmr_beta, dmr_p, dmr_fdr, dir, dmr_class, dist_to_gene)
+
+# All genes with a DMR and expression data; no significance filter on either side.
+# deseq2_lfc > 0 → up in Hyper; dmr_beta > 0 → more methylated in Hyper.
+# Methylation-suppresses-expression predicts opposite signs → negative Spearman ρ.
+multi_omic <- all_expr |>
+    inner_join(dmr_per_gene, by = c("gene_symbol" = "SYMBOL")) |>
+    mutate(
+        is_de = !is.na(deseq2_padj) & deseq2_padj < 0.05,
+        methyl_concordant = (dmr_beta > 0 & deseq2_lfc < 0) |
+                            (dmr_beta < 0 & deseq2_lfc > 0),
+        quadrant = case_when(
+            dmr_beta > 0 & deseq2_lfc < 0 ~ "More methyl in Hyper / Down in Hyper",
+            dmr_beta < 0 & deseq2_lfc > 0 ~ "Less methyl in Hyper / Up in Hyper",
+            dmr_beta > 0 & deseq2_lfc > 0 ~ "More methyl in Hyper / Up in Hyper",
+            dmr_beta < 0 & deseq2_lfc < 0 ~ "Less methyl in Hyper / Down in Hyper"
+        )
+    )
+```
+
+## Introduction
+
+Differential methylated regions were discovered between the hyper and hypo
+sepsis phenotypes. The question is how these regions relate to an entirely 
+independent bulk RNAseq dataset made up of sepsis patients who are also labeled
+as hyper or hypo inflammatory.
+
+Differential expression was performed with both DESeq2 and limma voom since
+there is some belief that DESeq2 has [inflated FDR in large population studies](https://pmc.ncbi.nlm.nih.gov/articles/PMC8922736/).
+That doesn't seem to be the case for this data, and DESeq2 and limma voom nearly
+entirely agree. I recommend using the deseq lfc and padj for analysis.
+
+The hypothesis is that **methylation suppresses expression**. Thus, genes with
+higher differential methylation in Hyper patients (positive `dmr_beta`) should
+have lower expression in Hyper relative to Hypo (negative or near-zero log2FC),
+and vice versa. This predicts a **negative** Spearman correlation between DMR
+mean beta and DESeq2 log2FC.
+
+
+## Data dictionary
+
+This is the dataframe shared with this notebook, which is an inner join
+(only gene symbols in both the unfiltered DE results and unfiltered DMR
+results) between the unfiltered differential expression results (both
+DESeq2 and limma-voom), and the unfiltered DMR regions (from the genomic
+ranges obj). For the DE results, I recommend using the deseq lfc and padj.
+The results of the two are very nearly identical, however.
+
+```{r data-dictionary}
+dict <- data.frame(
+  Group = c(
+    rep("Gene identity", 8),
+    rep("DESeq2 (Hyper vs Hypo)", 4),
+    rep("limma/voom (Hyper vs Hypo)", 4),
+    rep("Method concordance", 2),
+    rep("DMR", 6),
+    rep("Analysis flags", 3)
+  ),
+  Column = c(
+    "ensg", "gene_symbol", "gene_name", "gene_type",
+    "chr / start / end", "strand",
+    "autosomal_protein_coding", "hemoglobin_related",
+    "deseq2_lfc", "deseq2_pval", "deseq2_padj", "sig_deseq2",
+    "limma_lfc", "limma_pval", "limma_padj", "sig_limma",
+    "concordance", "dir_concordance",
+    "dmr_beta", "dmr_p", "dmr_fdr", "dir", "dmr_class", "dist_to_gene",
+    "is_de", "methyl_concordant", "quadrant"
+  ),
+  Description = c(
+    "Ensembl gene ID (primary key)",
+    "HGNC gene symbol",
+    "Full gene name",
+    'Biotype (e.g. "protein-coding")',
+    "Genomic coordinates of the gene body (hg38)",
+    "Transcription strand (+ / -)",
+    "TRUE if the gene is autosomal and protein-coding",
+    "TRUE if the gene encodes a hemoglobin subunit",
+    "Log2 fold-change (Hyper / Hypo); positive = higher in Hyper. Wald test on MLE (un-shrunken) estimates.",
+    "Wald test p-value",
+    "BH-adjusted p-value",
+    "TRUE if deseq2_padj < 0.05",
+    "Log2 fold-change (Hyper / Hypo); positive = higher in Hyper.",
+    "Moderated t-test p-value",
+    "BH-adjusted p-value",
+    "TRUE if limma_padj < 0.05",
+    '"Both" / "DESeq2 only" / "limma only" / "Neither" based on padj < 0.05 in each method',
+    '"Both (up)" / "Both (down)" / other concordance levels',
+    "Mean beta-value difference at the DMR (Hyper \u2212 Hypo); positive = more methylated in Hyper",
+    "Smallest DMR p-value across all DMRs mapped to this gene",
+    "BH-adjusted DMR p-value",
+    '"hyper" = more methylated in Hyper; "hypo" = more methylated in Hypo',
+    '"intragenic" if the DMR overlaps the gene body; "intergenic" otherwise',
+    "Distance in bp from the DMR to the nearest gene body (TxDb hg38); 0 for intragenic DMRs",
+    "TRUE if deseq2_padj < 0.05",
+    "TRUE if dmr_beta and deseq2_lfc have opposite signs, consistent with methylation-suppresses-expression",
+    'Quadrant label combining DMR and expression direction, e.g. "More methyl in Hyper / Down in Hyper"'
+  ),
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(dict, align = c("l", "l", "l"))
+```
+
+## Overview
+
+```{r overlap-summary}
+n_expr <- n_distinct(all_expr$gene_symbol)
+n_dmr  <- n_distinct(dmr_gr_annot$SYMBOL)
+n_ovlp <- n_distinct(multi_omic$gene_symbol)
+
+knitr::kable(
+    data.frame(
+        Category = c(
+            "Genes tested for DE (DESeq2)",
+            "Genes with ≥1 DMR (unfiltered)",
+            "Overlap: genes with both expression and DMR data"
+        ),
+        N = scales::comma(c(n_expr, n_dmr, n_ovlp))
+    ),
+    col.names = c("Category", "N"),
+    align = c("l", "r")
+)
+```
+
+## Methylation vs expression
+
+```{r dmr-de-scatter-quadrant}
+#| fig-width: 14
+#| fig-height: 6
+
+cor_test <- suppressWarnings(
+    cor.test(multi_omic$dmr_beta, multi_omic$deseq2_lfc, method = "spearman")
+)
+rho <- cor_test$estimate
+
+p_scatter <- ggplot(multi_omic,
+       aes(x = dmr_beta, y = deseq2_lfc,
+           color = is_de, alpha = is_de, size = is_de)) +
+    annotate("rect", xmin =    0, xmax =  Inf, ymin = -Inf, ymax = 0,
+             fill = "steelblue", alpha = 0.3) +
+    annotate("rect", xmin = -Inf, xmax =    0, ymin =    0, ymax = Inf,
+             fill = "steelblue", alpha = 0.3) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_point() +
+    scale_color_manual(
+        values = c("TRUE" = "firebrick", "FALSE" = "grey60"),
+        labels = c("TRUE" = "DE (padj < 0.05)", "FALSE" = "Not DE")
+    ) +
+    scale_alpha_manual(values = c("TRUE" = 0.8, "FALSE" = 0.3), guide = "none") +
+    scale_size_manual(values  = c("TRUE" = 1.8, "FALSE" = 1.0), guide = "none") +
+    labs(
+        x        = "DMR mean beta (positive = more methylated in Hyper)",
+        y        = "DESeq2 log2FC (positive = higher expression in Hyper)",
+        color    = NULL,
+        title    = "Methylation vs expression: all DMR genes",
+        subtitle = sprintf(
+            "Spearman \u03c1 = %.3f, p = %s | n = %d",
+            rho, signif(cor_test$p.value, 2), nrow(multi_omic)
+        )
+    ) +
+    theme_bw(base_size = 15) +
+    theme(legend.position = "bottom")
+
+p_quad <- multi_omic |>
+    dplyr::count(quadrant, methyl_concordant) |>
+    mutate(quadrant = str_wrap(quadrant, width = 30)) |>
+    ggplot(aes(y = reorder(quadrant, n), x = n, fill = methyl_concordant)) +
+    geom_col() +
+    geom_text(aes(label = scales::comma(n)), hjust = -0.2, size = 5) +
+    scale_x_continuous(expand = expansion(mult = c(0, 0.15)),
+                       labels = scales::comma) +
+    scale_fill_manual(
+        values = c("TRUE" = "steelblue", "FALSE" = "firebrick"),
+        labels = c("TRUE" = "Expected (methyl \u2192 suppress)", "FALSE" = "Unexpected")
+    ) +
+    labs(
+        y        = NULL,
+        x        = "Number of genes",
+        fill     = NULL,
+        title    = "Quadrant counts",
+        subtitle = "Blue = expected under methyl \u2192 suppress"
+    ) +
+    theme_bw(base_size = 15) +
+    theme(legend.position = "bottom")
+
+gridExtra::grid.arrange(p_scatter, p_quad, ncol = 2, widths = c(1.3, 1))
+```
+
+A Spearman correlation of ρ = `r round(cor_test$estimate, 3)`
+(p = `r signif(cor_test$p.value, 3)`, n = `r nrow(multi_omic)`) between DMR mean
+beta and DESeq2 log2FC indicates
+`r if (cor_test$estimate < 0) "a negative" else "a positive"` monotonic relationship.
+A significantly negative ρ would support the methylation-suppresses-expression
+hypothesis; the observed result
+`r if (cor_test$estimate < 0 & cor_test$p.value < 0.05) "is consistent with" else "does not support"` that model.
+
+## DMR region classification
+
+Each of the `r nrow(dmr_gr_annot)` DMRs was classified using distance to the
+nearest gene body (TxDb hg38, `r scales::comma(length(gene_ref))` genes).
+- **intragenic** if the DMR overlaps a gene body (distance = 0)
+- **intergenic** otherwise.
+
+```{r dmr-class-dist}
+#| fig-width: 8
+#| fig-height: 4
+
+intergenic <- dmr_gr_annot[dmr_gr_annot$dmr_class == "intergenic" &
+                            !is.na(dmr_gr_annot$dist_to_gene), ]
+med_dist <- median(intergenic$dist_to_gene)
+
+p_bar <- dmr_gr_annot |>
+    dplyr::count(dmr_class) |>
+    ggplot(aes(x = dmr_class, y = n, fill = dmr_class)) +
+    geom_col(show.legend = FALSE) +
+    geom_text(aes(label = scales::comma(n)), vjust = -0.4, size = 4) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.12)),
+                       labels = scales::comma) +
+    scale_fill_manual(values = c("intragenic" = "steelblue",
+                                 "intergenic" = "goldenrod")) +
+    labs(x = NULL, y = "Number of DMRs", title = "DMR class counts") +
+    theme_bw(base_size = 13)
+
+p_hist <- ggplot(intergenic, aes(x = log10(dist_to_gene))) +
+    geom_histogram(bins = 40, fill = "goldenrod", color = "white") +
+    geom_vline(xintercept = log10(med_dist), color = "firebrick",
+               linewidth = 1, linetype = "dashed") +
+    annotate("text", x = log10(med_dist) + 0.05,
+             y = Inf, vjust = 1.5, hjust = 0, size = 3.5, color = "firebrick",
+             label = sprintf("median = %s bp", scales::comma(round(med_dist)))) +
+    labs(x = "log10(distance to nearest gene, bp)", y = "Count",
+         title = "Intergenic DMR distances") +
+    theme_bw(base_size = 13)
+
+gridExtra::grid.arrange(p_bar, p_hist, ncol = 2)
+```
+
+
+```{r dmr-class-correlation}
+cor_by_class <- multi_omic |>
+    group_by(dmr_class) |>
+    summarise(
+        n   = n(),
+        rho = suppressWarnings(
+            cor(dmr_beta, deseq2_lfc, method = "spearman")
+        ),
+        pval = suppressWarnings(
+            cor.test(dmr_beta, deseq2_lfc, method = "spearman")$p.value
+        ),
+        pct_expected = round(100 * mean(methyl_concordant), 1),
+        .groups = "drop"
+    )
+
+knitr::kable(
+    cor_by_class |>
+        dplyr::select(
+            `DMR class`    = dmr_class,
+            N              = n,
+            `Spearman rho` = rho,
+            `p-value`      = pval,
+            `% expected`   = pct_expected
+        ) |>
+        mutate(across(`Spearman rho`, round, 3),
+               across(`p-value`, \(x) signif(x, 3))),
+    caption = "Methylation-expression correlation by DMR class"
+)
+```
+
+```{r dmr-class-scatter}
+#| fig-width: 10
+#| fig-height: 5
+
+multi_omic |>
+    mutate(dmr_class = factor(dmr_class,
+                              levels = c("intragenic", "intergenic"),
+                              labels = c("Intragenic", "Intergenic"))) |>
+    ggplot(aes(x = dmr_beta, y = deseq2_lfc,
+               color = is_de, alpha = is_de, size = is_de)) +
+    annotate("rect", xmin =    0, xmax =  Inf, ymin = -Inf, ymax = 0,
+             fill = "steelblue", alpha = 0.3) +
+    annotate("rect", xmin = -Inf, xmax =    0, ymin =    0, ymax = Inf,
+             fill = "steelblue", alpha = 0.3) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_point() +
+    scale_color_manual(
+        values = c("TRUE" = "firebrick", "FALSE" = "grey60"),
+        labels = c("TRUE" = "DE (padj < 0.05)", "FALSE" = "Not DE")
+    ) +
+    scale_alpha_manual(values = c("TRUE" = 0.8, "FALSE" = 0.3), guide = "none") +
+    scale_size_manual(values  = c("TRUE" = 1.8, "FALSE" = 1.0), guide = "none") +
+    facet_wrap(~dmr_class) +
+    labs(
+        x     = "DMR mean beta (positive = more methylated in Hyper)",
+        y     = "DESeq2 log2FC (positive = higher expression in Hyper)",
+        color = NULL,
+        title = "Methylation vs expression by DMR class",
+        subtitle = "Shaded quadrants = expected under methyl \u2192 suppress"
+    ) +
+    theme_bw(base_size = 13) +
+    theme(legend.position = "bottom")
+```
+
+Neither class shows a meaningful expected signal. Both intragenic and intergenic
+DMRs have a small positive ρ, and neither approaches significance in the expected
+(negative) direction. The intergenic class has a slightly higher proportion of
+expected-direction gene pairs (`r round(cor_by_class$pct_expected[cor_by_class$dmr_class == "intergenic"], 1)`%)
+than the intragenic class
+(`r round(cor_by_class$pct_expected[cor_by_class$dmr_class == "intragenic"], 1)`%),
+but the difference is modest and not reflected in the correlation.
+
+## DMRs near the gene body show greater expected directional effect on expression
+
+```{r dmr-distance-gradient}
+#| fig-width: 8
+#| fig-height: 5
+
+intergenic_mo <- multi_omic |>
+    filter(dmr_class == "intergenic") |>
+    mutate(
+        dist_bin = cut(dist_to_gene,
+                       breaks = quantile(dist_to_gene,
+                                         probs = seq(0, 1, by = 0.25)),
+                       include.lowest = TRUE,
+                       labels = c("Q1\n(nearest)", "Q2", "Q3", "Q4\n(farthest)"))
+    )
+
+dist_cor <- intergenic_mo |>
+    group_by(dist_bin) |>
+    summarise(
+        n    = n(),
+        rho  = suppressWarnings(cor(dmr_beta, deseq2_lfc, method = "spearman")),
+        pval = suppressWarnings(
+            cor.test(dmr_beta, deseq2_lfc, method = "spearman")$p.value),
+        dist_median = median(dist_to_gene),
+        .groups = "drop"
+    )
+
+ggplot(dist_cor, aes(x = dist_bin, y = rho)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+    geom_col(fill = "goldenrod", width = 0.6) +
+    geom_text(aes(label = sprintf("p = %s\nn = %d", signif(pval, 2), n)),
+              vjust = ifelse(dist_cor$rho >= 0, -0.3, 1.2), size = 3.5) +
+    scale_y_continuous(expand = expansion(mult = c(0.15, 0.15))) +
+    labs(
+        x        = "Distance to nearest gene (by quartile)",
+        y        = "Spearman \u03c1 (dmr_beta vs log2FC)",
+        title    = "Methylation\u2013expression correlation by distance from gene body",
+        subtitle = "Intergenic DMRs only | negative \u03c1 = expected under methyl \u2192 suppress"
+    ) +
+    theme_bw(base_size = 13)
+```
+
+```{r dmr-distance-table}
+knitr::kable(
+    dist_cor |>
+        dplyr::select(
+            `Distance quartile`  = dist_bin,
+            `Median distance (bp)` = dist_median,
+            N = n,
+            `Spearman rho`       = rho,
+            `p-value`            = pval
+        ) |>
+        mutate(
+            `Median distance (bp)` = scales::comma(round(`Median distance (bp)`)),
+            `Spearman rho`         = round(`Spearman rho`, 3),
+            `p-value`              = signif(`p-value`, 3)
+        ),
+    caption = "Methylation-expression correlation by intergenic distance quartile"
+)
+```
+
+The two nearest quartiles (Q1, median
+`r scales::comma(round(dist_cor$dist_median[1]))` bp; Q2, median
+`r scales::comma(round(dist_cor$dist_median[2]))` bp, max ~12,300 bp) both show
+slightly negative ρ, which is the expected direction given the assumption that 
+higher methylation depresses expression, while Q3 and Q4 flip positive, with
+the farthest DMRs showing the strongest
+positive ρ (ρ = `r round(dist_cor$rho[4], 3)`, p = `r signif(dist_cor$pval[4], 2)`).

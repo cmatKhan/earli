@@ -1,0 +1,8 @@
+.Rproj.user
+data/private/*
+deprecated
+.claude
+.positai
+*_cache
+*_files
+data/
