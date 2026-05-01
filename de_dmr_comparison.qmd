@@ -1,9 +1,18 @@
 ---
 title: "Methylation–Expression Concordance: DMRs vs Differential Expression"
 format:
-  html:
+  pdf:
     toc: true
     toc-depth: 2
+    toc-title: "Table of Contents"
+    number-sections: true
+    keep-tex: false
+    geometry:
+      - margin=1in
+    fontsize: 10pt
+    papersize: letter
+    fig-pos: "H"          # keep figures where they're placed
+    tables: true
 execute:
   echo: false
   warning: false
@@ -82,6 +91,11 @@ multi_omic <- all_expr |>
         )
     )
 ```
+
+```{r}
+# write_csv(multi_omic, here("data/private/dmr_de_inner.csv"))
+```
+
 
 ## Introduction
 
@@ -252,13 +266,8 @@ p_quad <- multi_omic |>
 gridExtra::grid.arrange(p_scatter, p_quad, ncol = 2, widths = c(1.3, 1))
 ```
 
-A Spearman correlation of ρ = `r round(cor_test$estimate, 3)`
-(p = `r signif(cor_test$p.value, 3)`, n = `r nrow(multi_omic)`) between DMR mean
-beta and DESeq2 log2FC indicates
-`r if (cor_test$estimate < 0) "a negative" else "a positive"` monotonic relationship.
-A significantly negative ρ would support the methylation-suppresses-expression
-hypothesis; the observed result
-`r if (cor_test$estimate < 0 & cor_test$p.value < 0.05) "is consistent with" else "does not support"` that model.
+A positive correlation means that more methylation is correlated with greater
+expression, the opposite of our hypothesis.
 
 ## DMR region classification
 
@@ -367,13 +376,7 @@ multi_omic |>
     theme(legend.position = "bottom")
 ```
 
-Neither class shows a meaningful expected signal. Both intragenic and intergenic
-DMRs have a small positive ρ, and neither approaches significance in the expected
-(negative) direction. The intergenic class has a slightly higher proportion of
-expected-direction gene pairs (`r round(cor_by_class$pct_expected[cor_by_class$dmr_class == "intergenic"], 1)`%)
-than the intragenic class
-(`r round(cor_by_class$pct_expected[cor_by_class$dmr_class == "intragenic"], 1)`%),
-but the difference is modest and not reflected in the correlation.
+Neither class shows a meaningful expected signal.
 
 ## DMRs near the gene body show greater expected directional effect on expression
 
@@ -412,7 +415,7 @@ ggplot(dist_cor, aes(x = dist_bin, y = rho)) +
         x        = "Distance to nearest gene (by quartile)",
         y        = "Spearman \u03c1 (dmr_beta vs log2FC)",
         title    = "Methylation\u2013expression correlation by distance from gene body",
-        subtitle = "Intergenic DMRs only | negative \u03c1 = expected under methyl \u2192 suppress"
+        subtitle = "Intergenic DMRs only | negative = expected under methyl \u2192 suppress"
     ) +
     theme_bw(base_size = 13)
 ```

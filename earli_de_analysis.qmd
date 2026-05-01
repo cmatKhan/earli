@@ -1,10 +1,18 @@
 ---
 title: "EARLI LCA Differential Expression"
 format:
-  html:
+  pdf:
     toc: true
-    toc-depth: 3
-    self-contained: true
+    toc-depth: 2
+    toc-title: "Table of Contents"
+    number-sections: true
+    keep-tex: false
+    geometry:
+      - margin=1in
+    fontsize: 10pt
+    papersize: letter
+    fig-pos: "H"          # keep figures where they're placed
+    tables: true
 execute:
   echo: false
   warning: false
